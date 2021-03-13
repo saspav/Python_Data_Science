@@ -16,3 +16,4 @@ process_data.py - скрипт препроцессинга данных
 
 tune_models.py - скрипт настройки и обучения моделей и получение предсказаний
 
+real_estate.ipynb - ноутбук с ииследованием данных и кодом скриптов process_data.py и tune_models.py
