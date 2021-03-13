@@ -1,1 +1,1 @@
-
+Корневой каталог для курсового проекта Real Estate Price Prediction
