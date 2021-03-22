@@ -16,8 +16,8 @@ from sklearn.metrics import classification_report
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.ensemble import GradientBoostingClassifier
 from lightgbm import LGBMRegressor, LGBMClassifier
-
 from catboost import CatBoostClassifier
+from scipy.stats import mannwhitneyu
 
 warnings.filterwarnings("ignore")
 
@@ -459,6 +459,7 @@ class DataProcessing(ReadWriteDataset):
                           '6 years': 6, '7 years': 7, '8 years': 8,
                           '9 years': 9, '10+ years': 10}
         self.alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        self.num_debt_bins = 7
         self.debt_bins = None
         self.debt_labels = None
         self.med_debt_income = None
@@ -496,6 +497,16 @@ class DataProcessing(ReadWriteDataset):
         # добавление групп долга
         df['debt_group'] = pd.cut(df.MonthlyDebt, bins=self.debt_bins,
                                   labels=self.debt_labels).astype('str')
+
+        # # добавление разницы между балансом и долгом
+        # df['rest_bal_debt'] = df.CurrentCreditBalance - df.MonthlyDebt
+        # # возвращается кортеж:
+        # _, rest_bins = pd.qcut(df.rest_bal_debt, q=self.num_debt_bins,
+        #                        precision=0, retbins=True)
+        # rest_bins[0] = -np.inf
+        # rest_bins[-1] = np.inf
+        # df['rest_bal_group'] = pd.cut(df.rest_bal_debt, bins=rest_bins,
+        #                               labels=self.debt_labels).astype('str')
         return df
 
     @staticmethod
@@ -517,68 +528,56 @@ class DataProcessing(ReadWriteDataset):
         """Сохранение статистик"""
         df = df_in.copy(deep=True)
 
-        if num_debt_bins < 3:
-            num_debt_bins = 7
+        if num_debt_bins > 3:
+            self.num_debt_bins = num_debt_bins
         # возвращается кортеж:
-        _, self.debt_bins = pd.qcut(df.MonthlyDebt, q=num_debt_bins,
+        _, self.debt_bins = pd.qcut(df.MonthlyDebt, q=self.num_debt_bins,
                                     precision=0, retbins=True)
-        self.debt_bins[0] = -1
+        self.debt_bins[0] = -np.inf
         self.debt_bins[-1] = np.inf
         self.debt_labels = [self.alphabet[i] for i in range(num_debt_bins)]
 
         # небольшой препроцессинг, который нужен в двух методах fit и transform
         df = self.preprocess_df(df)
 
-        # медианный доход по группам долга
+        # Расчет медиан
+        self.medians = df.median()
+
+        # медианный AnnualIncome по группам debt_group
         self.med_debt_income = df.groupby('debt_group').agg(
             {'AnnualIncome': 'median'}).to_dict()['AnnualIncome']
         # print(self.med_debt_income)
 
+        # медианный CreditScore по группам NumberOfCreditProblems
         self.med_problems_score = df.groupby('NumberOfCreditProblems').agg(
             {'CreditScore': 'median'}).astype('int').to_dict()['CreditScore']
         self.med_problems_score[3] -= 10
         # print(self.med_problems_score)
 
-        # Расчет медиан
-        self.medians = df.median()
-
         self.YearsInCurrentJob = df.YearsInCurrentJob.mode()[0]
 
-        cond = df.CurrentLoanAmount < 99999999
-        # cond = True - попробовать модель такую median будет выше
-        # группировка CurrentLoanAmount по группам Purpose
-        grp_loan_purpose = df[cond].groupby('Purpose',
-                                            as_index=False).agg(
-            {'CurrentLoanAmount': ['median', 'mean']})
-        grp_loan_purpose.columns = ['Purpose', 'loan_median', 'loan_mean']
-        grp_loan_purpose['med_mean'] = grp_loan_purpose.mean(axis=1)
-        grp_loan_purpose = grp_loan_purpose.round(0)
-        grp_loan_purpose = grp_loan_purpose.set_index('Purpose')
-        for attr in ('loan_median', 'loan_mean', 'med_mean'):
-            name_atr = f'purpose_{attr}'
-            name_grp = grp_loan_purpose[attr]
-            name_grp.columns = ['CurrentLoanAmount']
-            name_grp = name_grp.to_dict()
-            setattr(DataProcessing, name_atr, name_grp)
-            # print(name_atr)
-            # print(name_grp)
-
-        # группировка CurrentLoanAmount по группам debt_group
-        grp_loan_debt_grp = df[cond].groupby('debt_group',
-                                             as_index=False).agg(
-            {'CurrentLoanAmount': ['median', 'mean']})
-        grp_loan_debt_grp.columns = ['debt_group', 'loan_median', 'loan_mean']
-        grp_loan_debt_grp['med_mean'] = grp_loan_debt_grp.mean(axis=1)
-        grp_loan_debt_grp = grp_loan_debt_grp.round(0)
-        grp_loan_debt_grp = grp_loan_debt_grp.set_index('debt_group')
-        for attr in ('loan_median', 'loan_mean', 'med_mean'):
-            name_atr = f'debt_group_{attr}'
-            name_grp = grp_loan_debt_grp[attr]
-            name_grp.columns = ['CurrentLoanAmount']
-            name_grp = name_grp.to_dict()
-            setattr(DataProcessing, name_atr, name_grp)
-            # print(name_atr)
-            # print(name_grp)
+        features_isna = {'AnnualIncome': ~df.AnnualIncome.isna(),
+                         'CurrentLoanAmount': df.CurrentLoanAmount < 99999999,
+                         'CreditScore': ~df.CreditScore.isna()}
+        for name_feature, cond in features_isna.items():
+            print(name_feature)
+            # группировка признака по группам Purpose и debt_group
+            for col_groupby in ('Purpose', 'debt_group',
+                                'NumberOfCreditProblems'):
+                grp_feat = df[cond].groupby(col_groupby, as_index=False).agg(
+                    {name_feature: ['median', 'mean']})
+                grp_feat.columns = [col_groupby, 'feat_median', 'feat_mean']
+                grp_feat['feat_med_mean'] = grp_feat.mean(axis=1)
+                grp_feat = grp_feat.round(0)
+                grp_feat = grp_feat.set_index(col_groupby)
+                for attr in ('feat_median', 'feat_mean', 'feat_med_mean'):
+                    name_atr = f'{col_groupby}_{attr}'
+                    name_grp = grp_feat[attr]
+                    name_grp.columns = [name_feature]
+                    name_grp = name_grp.to_dict()
+                    setattr(DataProcessing, name_atr, name_grp)
+                    print(name_atr)
+                    print(name_grp)
 
     @staticmethod
     def fill_ai_cla_cs(df_in, num_pos, indexes_isna):
@@ -590,6 +589,8 @@ class DataProcessing(ReadWriteDataset):
         :param indexes_isna: индексы пропущенных значений
         :return: ДФ
         """
+        df_lrn = df_in.copy(deep=True)
+
         # эти колонки исключаем из обучения
         excld_cols = ['AnnualIncome', 'CurrentLoanAmount', 'CreditScore']
         group_cols = ['HomeOwnership', 'grp_purpose', 'debt_group']
@@ -607,8 +608,6 @@ class DataProcessing(ReadWriteDataset):
                   2: LGBMRegressor(learning_rate=0.1, max_depth=3,
                                    n_estimators=140, num_leaves=63,
                                    random_state=SEED)}
-        df_lrn = df_in.copy(deep=True)
-
         if num_pos < 2:
             df_lrn.loc[df_lrn.CurrentLoanAmount >= 99999999,
                        'CurrentLoanAmount'] = np.NaN
@@ -687,13 +686,13 @@ class DataProcessing(ReadWriteDataset):
         # посмотреть на каком усреднении будет выше F1_score
         cond = df.CurrentLoanAmount >= 99999999
         # CurrentLoanAmount замена значений 99999999 на медиану по Purpose
-        # name_atr = 'purpose_loan_median'
-        # name_atr = 'purpose_loan_mean'
-        name_atr = 'purpose_med_mean'
+        # name_atr = 'Purpose_feat_median'
+        # name_atr = 'Purpose_feat_mean'
+        name_atr = 'Purpose_feat_med_mean'
         # CurrentLoanAmount замена значений 99999999 на медиану по debt_group
-        # name_atr = 'debt_group_loan_median'
-        # name_atr = 'debt_group_loan_mean'
-        # name_atr = 'debt_group_med_mean'
+        # name_atr = 'debt_group_feat_median'
+        # name_atr = 'debt_group_feat_mean'
+        # name_atr = 'debt_group_feat_med_mean'
         df.loc[cond, 'CurrentLoanAmount'] = df[cond].Purpose.map(
             getattr(DataProcessing, name_atr))
         # print(df[cond][['Purpose', 'CurrentLoanAmount']])
@@ -758,11 +757,41 @@ if __name__ == "__main__":
     processor_data = DataProcessing()
     dataset = processor_data.concat_df(train, test)
 
+    # NUM_FEATURE_NAMES = dataset.select_dtypes(
+    #     include='float64').columns.values.tolist() + dataset.select_dtypes(
+    #     include='int32').columns.values.tolist()
+    # NUM_FEATURE_NAMES.remove('CreditDefault')
+    # print(NUM_FEATURE_NAMES)
+    # for col in NUM_FEATURE_NAMES:
+    #     plt.figure(figsize=(8, 4))
+    #     sns.kdeplot(data=dataset, x=col, shade=True, hue='Learn',
+    #                 hue_order=[1, 0])
+    #     print(col)
+    #     print(mannwhitneyu(dataset[dataset.Learn == 1][col],
+    #                        dataset[dataset.Learn == 0][col]))
+    #     plt.title(col)
+    #     plt.show()
+
+    # CAT_FEATURE_NAMES = dataset.select_dtypes(
+    #     include='object').columns.values.tolist()
+    # print(CAT_FEATURE_NAMES)
+    # num_feature = 'CurrentCreditBalance'
+    # for col in CAT_FEATURE_NAMES:
+    #     sns.set(font_scale=1.1)
+    #     fig, ax = plt.subplots(figsize=(16, 6))
+    #     sns.pointplot(data=dataset, x=col, y=num_feature, capsize=.1,
+    #                   shade=True, hue='Learn', hue_order=[1, 0])
+    #     plt.title(col)
+    #     plt.setp(ax.get_xticklabels(), rotation=90)
+    #     plt.tight_layout()
+    #     plt.show()
+
     print(f'Обработка данных')
     start_time = time.time()
     processor_data.fit(dataset, num_debt_bins=7)
     exclude_columns = ['HomeOwnership', 'grp_purpose']
-    dataset = processor_data.transform(dataset, exclude_cols=exclude_columns)
+    dataset = processor_data.transform(dataset,
+                                       exclude_cols=exclude_columns)
     processor_data.write_dataset(dataset, FILE_WITH_FEATURES)
     print_time(start_time)
 
@@ -808,7 +837,8 @@ if __name__ == "__main__":
           f'{test_df.isna().sum().sum()}')
 
     # было test_size=0.2
-    X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2,
+    X_train, X_valid, y_train, y_valid = train_test_split(X, y,
+                                                          test_size=0.2,
                                                           shuffle=True,
                                                           random_state=SEED,
                                                           stratify=y
@@ -879,20 +909,20 @@ if __name__ == "__main__":
     #     # 'min_samples_split': [19]
     # }
 
-    f_params = {
-        'boosting_type': ['dart'],
-        # 'boosting_type': ['dart', 'gbdt'],
-        # 'n_estimators': [1000],
-        'n_estimators': list(range(900, 1301, 50)),
-        # 'max_bin': [512],
-        'max_depth': [5],
-        # 'learning_rate': [.05]
-        'learning_rate': [.005, .01, .025, .05, 0.1]
-        # 'min_samples_leaf': list(range(1, 9, 2)),
-        # 'min_samples_split': list(range(2, 9, 2)),  # не меньше 2
-        # 'min_samples_leaf': [3],
-        # 'min_samples_split': [19]
-    }
+    # f_params = {
+    #     'boosting_type': ['dart'],
+    #     # 'boosting_type': ['dart', 'gbdt'],
+    #     # 'n_estimators': [1000],
+    #     'n_estimators': list(range(900, 1301, 50)),
+    #     # 'max_bin': [512],
+    #     'max_depth': [5],
+    #     # 'learning_rate': [.05]
+    #     'learning_rate': [.005, .01, .025, .05, 0.1]
+    #     # 'min_samples_leaf': list(range(1, 9, 2)),
+    #     # 'min_samples_split': list(range(2, 9, 2)),  # не меньше 2
+    #     # 'min_samples_leaf': [3],
+    #     # 'min_samples_split': [19]
+    # }
     # раскомментарить эту строку для расчета
     # _, feat_imp_df_ = process_model(mdl, params=f_params, fold_single=5,
     #                                 verbose=1, build_model=True)
@@ -908,16 +938,17 @@ if __name__ == "__main__":
         # 'iterations': [5, 7, 10, 20, 30, 50, 100],
         # 'max_depth': [3, 5, 7, 10],
         'max_depth': range(5, 6),
-        'iterations': range(50, 151, 10),
+        'iterations': range(10, 151, 10),
         # 'learning_rate': [.005, .01, .025, .05]
     }
     # поставил общий дисбаланс попробовать это грузануть
-    imbalance = y.value_counts()[0] / y.value_counts()[1]
+    # imbalance = y.value_counts()[0] / y.value_counts()[1]
 
     model = CatBoostClassifier(silent=True, random_state=SEED,
                                class_weights=[1, imbalance],
                                cat_features=category_columns,
-                               eval_metric='F1', early_stopping_rounds=50, )
+                               eval_metric='F1',
+                               early_stopping_rounds=50, )
 
     feat_imp_df_ = process_model(model, params=params, fold_single=5,
                                  verbose=1, build_model=True)
