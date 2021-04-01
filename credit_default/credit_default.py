@@ -14,10 +14,14 @@ from sklearn.metrics import r2_score as r2
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.metrics import classification_report
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.ensemble import GradientBoostingClassifier
-from lightgbm import LGBMRegressor, LGBMClassifier
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, CatBoostRegressor
 from scipy.stats import mannwhitneyu
+from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import AgglomerativeClustering
+
+import featuretools as ft
+import featuretools.variable_types as vtypes
+from itertools import combinations
 
 warnings.filterwarnings("ignore")
 
@@ -35,9 +39,33 @@ rcParams.update({'font.size': 14})  # размер шрифта на графи�
 pd.options.display.max_columns = 100
 global_start_time = time.time()
 
+TargetEnc = [
+    'TargetEnc_grp_purpose',
+    'TargetEnc_debt_group',
+    'TargetEnc_rest_bal_group',
+    'TargetEnc_NumberOfCreditProblems',
+    'TargetEnc_HomeOwnership',
+    'TargetEnc_purpose_term',
+    'TargetEnc_grp_purpose_debt_group',
+    'TargetEnc_grp_purpose_rest_bal_group',
+    'TargetEnc_grp_purpose_NumberOfCreditProblems',
+    'TargetEnc_grp_purpose_HomeOwnership',
+    'TargetEnc_grp_purpose_purpose_term',
+    'TargetEnc_debt_group_rest_bal_group',
+    'TargetEnc_debt_group_NumberOfCreditProblems',
+    'TargetEnc_debt_group_HomeOwnership',
+    'TargetEnc_debt_group_purpose_term',
+    'TargetEnc_rest_bal_group_NumberOfCreditProblems',
+    'TargetEnc_rest_bal_group_HomeOwnership',
+    'TargetEnc_rest_bal_group_purpose_term',
+    'TargetEnc_NumberOfCreditProblems_HomeOwnership',
+    'TargetEnc_NumberOfCreditProblems_purpose_term',
+    'TargetEnc_HomeOwnership_purpose_term'
+]
 
-def process_model(use_model=RandomForestClassifier(random_state=SEED),
-                  params={'max_depth': [7]}, folds_range=[], fold_single=5,
+
+def process_model(use_model=CatBoostClassifier(random_state=SEED),
+                  params={'max_depth': [5]}, folds_range=[], fold_single=5,
                   verbose=0, build_model=False):
     """
     Поиск лучшей модели
@@ -60,15 +88,13 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
         """
         skf = StratifiedKFold(n_splits=n_fold, random_state=SEED, shuffle=True)
         if cat == 'cb_':
-            gscv = model.grid_search(params, X_train, y_train, cv=skf,
-                                     stratified=True, refit=True)
-            model.fit(X_train, y_train)
-            y_train_pred = model.predict(X_train)
-            y_valid_pred = model.predict(X_valid)
+            gscv = use_model.grid_search(params, X_train, y_train, cv=skf,
+                                         stratified=True, refit=True)
+            use_model.fit(X_train, y_train)
+            y_train_pred = use_model.predict(X_train)
+            y_valid_pred = use_model.predict(X_valid)
             best_ = gscv['params']
-            f1_train = np.array(gscv['cv_results']['train-Logloss-mean']).max()
-            f1_valid = np.array(gscv['cv_results']['test-Logloss-mean']).max()
-            gscv = model
+            gscv = use_model
         else:
             gscv = GridSearchCV(use_model, params, cv=skf, scoring='f1',
                                 verbose=verb, n_jobs=USE_CORES)
@@ -77,8 +103,8 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
             best_tree_cv = gscv.best_estimator_
             y_train_pred = best_tree_cv.predict(X_train)
             y_valid_pred = best_tree_cv.predict(X_valid)
-            f1_train = f1_score(y_train, y_train_pred)
-            f1_valid = f1_score(y_valid, y_valid_pred)
+        f1_train = f1_score(y_train, y_train_pred)
+        f1_valid = f1_score(y_valid, y_valid_pred)
         print(f'folds={n_fold:2d}, f1_score_train={f1_train:0.7f},'
               f' f1_score_valid={f1_valid:0.7f}'
               f' best_params={best_}')
@@ -139,8 +165,15 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
         search.fit(X, y)
         submit = pd.read_csv(FILE_SAMPLE, index_col='Id')
         submit['Credit Default'] = search.predict(test_df)
+        submit_proba = submit.copy(deep=True)
+        submit_proba['p_value'] = search.predict_proba(test_df)[:, 1]
+        submit_proba['new'] = submit_proba['p_value'].apply(
+            lambda x: 1 if x > 0.4996 else 0)
+        submit_proba['Credit Default'] = submit_proba['new']
+        submit_proba.drop(['p_value', 'new'], axis=1, inplace=True)
+        submit_proba.to_csv(file_submit_csv)
         date_now = datetime.now()
-        time_stamp = date_now.strftime('%y%m%d%H%M')
+        time_stamp = date_now.strftime('%y%m%d%H%M%S')
         submit.to_csv(file_submit_csv.replace('.csv', f'_{time_stamp}.csv'))
         # сохранение результатов итерации в файл
         file_name = os.path.join(PATH_EXPORT, 'results.csv')
@@ -150,6 +183,13 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
                                                 format='%y-%m-%d %H:%M:%S')
             file_df.time_stamp = file_df.time_stamp.dt.strftime(
                 '%y-%m-%d %H:%M:%S')
+            if 'delta' not in file_df.columns:
+                file_df.insert(6, 'delta', 0)
+            if 'comment' not in file_df.columns:
+                file_df['comment'] = ''
+            # удаление колонок после 'comment'
+            list_columns = file_df.columns.to_list()
+            file_df = file_df[list_columns[:list_columns.index('comment') + 1]]
         else:
             file_df = pd.DataFrame()
         time_stamp = date_now.strftime('%y-%m-%d %H:%M:%S')
@@ -160,19 +200,22 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
                                 'folds': fold_single,
                                 'f1_train': f1_trn,
                                 'f1_valid': f1_vld,
+                                'delta': f1_trn - f1_vld,
                                 'best_params': [prms],
                                 'features': [features_list],
                                 'column_dummies': [processor_data.dummy],
                                 'model_columns': [model_columns],
                                 'category_columns': [category_columns],
-                                'learn_exclude': [learn_exclude]
+                                'learn_exclude': [learn_exclude],
+                                'comment': [processor_data.comment]
                                 })
 
         file_df = file_df.append(temp_df)
         file_df.f1_train = file_df.f1_train.round(7)
         file_df.f1_valid = file_df.f1_valid.round(7)
+        file_df.delta = file_df.f1_train - file_df.f1_valid
         file_df.to_csv(file_name, index=False)
-        file_df.name = 'results'
+        file_df.name_export_to_excel = 'results'
         # экспорт в эксель
         export_to_excel(file_df)
         print_time(start_time_cv)
@@ -181,16 +224,20 @@ def process_model(use_model=RandomForestClassifier(random_state=SEED),
         return best_folds
 
 
-def find_depth(use_model, max_depth_values=range(3, 11), not_sklearn=False,
+def find_depth(use_model, max_depth_values=range(3, 11), not_sklearn=0,
                show_plot=True):
     print(use_model)
     # Подберем оптимальное значение глубины обучения дерева.
     scores = pd.DataFrame(columns=['max_depth', 'train_score', 'valid_score'])
     for max_depth in max_depth_values:
         print(f'max_depth = {max_depth}')
-        if not_sklearn:
+        if not_sklearn == 1:
             find_model = use_model(random_state=SEED, max_depth=max_depth,
                                    num_leaves=63)
+        elif not_sklearn == 2:
+            find_model = use_model(random_state=SEED, max_depth=max_depth,
+                                   silent=True, early_stopping_rounds=20,
+                                   cat_features=category_columns)
         else:
             find_model = use_model(random_state=SEED, max_depth=max_depth)
 
@@ -216,7 +263,7 @@ def find_depth(use_model, max_depth_values=range(3, 11), not_sklearn=False,
         # Визуализация
         plt.figure(figsize=(12, 7))
         sns.lineplot(x='max_depth', y='score', hue='dataset_type',
-                     data=scores_data)
+                     data=scores_data, markers=True)
         plt.show()
     print(scores.sort_values('valid_score', ascending=False))
     print()
@@ -233,15 +280,15 @@ def print_time(time_start):
     """
     time_apply = time.time() - time_start
     hrs = time_apply // 3600
-    min = time_apply % 3600
-    sec = min % 60
-    print(f'Время обработки: {hrs:.0f} час {min // 60:.0f} мин {sec:.1f} сек')
+    mns = time_apply % 3600
+    sec = mns % 60
+    print(f'Время обработки: {hrs:.0f} час {mns // 60:.0f} мин {sec:.1f} сек')
 
 
-def evaluate_preds(mdl, X_train, X_test, y_train, y_test):
-    y_train_pred = mdl.predict(X_train)
-    y_test_pred = mdl.predict(X_test)
-    show_classification_report(y_train, y_train_pred, y_test, y_test_pred)
+def evaluate_preds(mdl, x_train, x_valid, ytrain, yvalid):
+    y_train_pred = mdl.predict(x_train)
+    y_valid_pred = mdl.predict(x_valid)
+    show_classification_report(ytrain, y_train_pred, yvalid, y_valid_pred)
 
 
 def show_classification_report(y_train_true, y_train_pred, y_valid_true,
@@ -284,7 +331,7 @@ def export_to_excel(data: pd.DataFrame) -> None:
     :param data: dataframe
     :return: None
     """
-    name_data = data.name
+    name_data = data.name_export_to_excel
     file_xls = os.path.join(PATH_EXPORT, f'{name_data}.xlsx')
     writer = pd.ExcelWriter(file_xls, engine='xlsxwriter')
     data.to_excel(writer, sheet_name=name_data, startrow=1,
@@ -315,7 +362,7 @@ def export_to_excel(data: pd.DataFrame) -> None:
         elif value in ('mdl', 'folds'):
             width = 8
         elif value in ('max_depth', 'f1_train', 'f1_valid',
-                       'r2_train', 'r2_valid'):
+                       'r2_train', 'r2_valid', 'delta'):
             width = 14
         else:
             width = 32
@@ -408,6 +455,7 @@ class NewTargetFeature:
     def __init__(self):
         """ Инициализация класса """
         self.indexes = None
+        self.cat_features = []
         self.exclude_columns = ['Learn']
         self.learn_columns = []
         self.dummy = []
@@ -427,8 +475,6 @@ class NewTargetFeature:
         df = df_in.copy(deep=True)
         # Добавление новых признаков
         df = DataProcessing.new_features(df)
-        df.loc[df.TaxLiens > 0, 'TaxLiens'] = 1
-        df.loc[df.NumberOfCreditProblems > 0, 'NumberOfCreditProblems'] = 1
 
         # деление категорий по столбцам
         if self.dummy:
@@ -453,21 +499,36 @@ class DataProcessing(ReadWriteDataset):
         """Параметры класса"""
         self.df_all = pd.DataFrame
         self.medians = None
+        self.min_MonthlyDebt = None
+        self.max_MonthsLastDel = None
         self.YearsInCurrentJob = None
         self.bin_years = {'< 1 year': 0, '1 year': 1, '2 years': 2,
                           '3 years': 3, '4 years': 4, '5 years': 5,
                           '6 years': 6, '7 years': 7, '8 years': 8,
                           '9 years': 9, '10+ years': 10}
+        self.cat_groups = ['grp_purpose', 'debt_group', 'rest_bal_group',
+                           'NumberOfCreditProblems', 'HomeOwnership',
+                           'purpose_term']
+        self.features_good = ['AnnualIncomeIsGood', 'CurrentLoanAmountIsGood',
+                              'CreditScoreIsGood', 'calc_monthsIsGood',
+                              'MonthsSinceLastDelinquentIsGood']
+        self.target_encoding_feats = []
         self.alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
         self.num_debt_bins = 7
         self.debt_bins = None
         self.debt_labels = None
+        self.num_history_bins = 7
+        self.history_bins = None
+        self.history_labels = None
+        self.med_history_job = None
         self.med_debt_income = None
         self.med_problems_score = None
         self.dummy = []
         self.cat_features = []
         self.exclude_columns = ['Learn', 'debt_group']
         self.learn_columns = []
+        self.comment = []
+        self.tsne_columns = []
 
     @staticmethod
     def concat_df(df_train, df_test):
@@ -480,7 +541,44 @@ class DataProcessing(ReadWriteDataset):
         return df
 
     def preprocess_df(self, df_in):
+        """
+        Небольшая предобработка данных для дальнейшей обработки
+        :param df_in: ДФ
+        :return: предобработанный ДФ
+        """
         df = df_in.copy(deep=True)
+
+        # для групировки по целям кредита
+        df['grp_purpose'] = df.Purpose
+
+        # # вот это добавил новое
+        # # MonthlyDebt на трейне удалим нулевые значения
+        # # если удалить - рейтинг хуже
+        # df = df[~((df.Learn == 1) & (df.MonthlyDebt < 0.1))]
+        # # нулевые значения заменим на минимальные для этой колонки
+        df.loc[df.MonthlyDebt < 0.1, 'MonthlyDebt'] = self.min_MonthlyDebt
+
+        # # MonthsSinceLastDelinquent заполнение выбросов - с этим хуже:
+        # df.loc[df.MonthsSinceLastDelinquent > self.max_MonthsLastDel,
+        #        'MonthsSinceLastDelinquent'] = self.max_MonthsLastDel
+
+        # заменим выбросы на NaN
+        df.loc[df.CurrentLoanAmount >= 99999999, 'CurrentLoanAmount'] = np.NaN
+
+        # посчитаем количество месяцев кредита
+        df['calc_months'] = df.CurrentLoanAmount / df.MonthlyDebt
+        # выбросы заменим на NaN
+        max_months = df.calc_months.quantile(0.995)
+        df.loc[df.calc_months > max_months, 'calc_months'] = np.NaN
+
+        df.Term = df.Term.map({'Short Term': 0, 'Long Term': 1})
+        df.Term = df.Term.astype('int')
+
+        # YearsInCurrentJob преобразуем в числовые значения
+        df.YearsInCurrentJob = df.YearsInCurrentJob.map(self.bin_years)
+
+        # новый признак цель кредита + срок
+        df['purpose_term'] = df.grp_purpose + ' ' + df.Term.astype('str')
 
         # TaxLiens уменьшим кол-во групп
         df.loc[df.TaxLiens > 4, 'TaxLiens'] = 5
@@ -498,24 +596,38 @@ class DataProcessing(ReadWriteDataset):
         df['debt_group'] = pd.cut(df.MonthlyDebt, bins=self.debt_bins,
                                   labels=self.debt_labels).astype('str')
 
-        # # добавление разницы между балансом и долгом
-        # df['rest_bal_debt'] = df.CurrentCreditBalance - df.MonthlyDebt
-        # # возвращается кортеж:
-        # _, rest_bins = pd.qcut(df.rest_bal_debt, q=self.num_debt_bins,
-        #                        precision=0, retbins=True)
-        # rest_bins[0] = -np.inf
-        # rest_bins[-1] = np.inf
-        # df['rest_bal_group'] = pd.cut(df.rest_bal_debt, bins=rest_bins,
-        #                               labels=self.debt_labels).astype('str')
+        # добавление групп кредитной истории
+        df['history_group'] = pd.cut(df.YearsOfCreditHistory,
+                                     bins=self.history_bins,
+                                     labels=self.history_labels).astype('str')
+
+        # добавление разницы между балансом и долгом
+        df['rest_bal_debt'] = df.CurrentCreditBalance - df.MonthlyDebt
+        # возвращается кортеж:
+        _, rest_bins = pd.qcut(df.rest_bal_debt, q=self.num_debt_bins,
+                               precision=0, retbins=True)
+        rest_bins[0] = -np.inf
+        rest_bins[-1] = np.inf
+        if rest_bins[0] < 0 < rest_bins[1]:
+            rest_bins[1] = 0
+        df['rest_bal_group'] = pd.cut(df.rest_bal_debt, bins=rest_bins,
+                                      labels=self.debt_labels).astype('str')
         return df
 
     @staticmethod
     def new_features(df_in):
+        """
+        Добавление новых признаков:
+        :param df_in: ДФ
+        :return: ДФ с новыми признаками
+        """
         df = df_in.copy(deep=True)
 
-        # Добавление новых признаков:
-        df.Term = df.Term.map({'Short Term': 0, 'Long Term': 1})
+        # попробовать эти три строки не делать
         df.loc[df.Bankruptcies > 0, 'Bankruptcies'] = 1
+        df.loc[df.TaxLiens > 0, 'TaxLiens'] = 1
+        # df.loc[df.NumberOfCreditProblems > 0, 'NumberOfCreditProblems'] = 1
+
         # сгруппируем цели: три большие группы в одну и остальные в другую
         df['grp_purpose'] = df.Purpose
         purpose = ['debt consolidation', 'other', 'home improvements']
@@ -524,9 +636,50 @@ class DataProcessing(ReadWriteDataset):
         df.Purpose = df.Purpose.astype(int)
         return df
 
-    def fit(self, df_in, num_debt_bins=7):
+    def make_clusters(self, df, n_clusters):
+        """
+        Разбиение датасета на кластеры
+        :param df:
+        :param n_clusters:
+        :param all_data: кластеризация на всем датасете
+        :return: ДФ с кластерами
+        """
+        print(f'Кластеризация')
+        cls_time = time.time()
+        # # исходные колонки
+        col_clusters = self.tsne_columns[:15]
+        # # колонки после препроцессинга
+        # col_clusters = self.tsne_columns
+
+        col_clusters = [col for col in col_clusters if
+                        str(df[col].dtype) not in ('object', 'category')]
+
+        print('self.tsne_columns', self.tsne_columns)
+        print('col_clusters', col_clusters)
+
+        scaler = RobustScaler()
+        train_scaled = pd.DataFrame(scaler.fit_transform(df[col_clusters]),
+                                    columns=col_clusters, index=df.index)
+
+        aggl = AgglomerativeClustering(n_clusters=n_clusters)
+        labels = aggl.fit_predict(train_scaled)
+        labels = pd.DataFrame(data=labels, columns=['cluster'], index=df.index)
+
+        self.dummy.extend(['cluster'])
+        print_time(cls_time)
+        return labels
+
+    def fit(self, df_in, num_debt_bins=7, num_history_bins=7):
         """Сохранение статистик"""
         df = df_in.copy(deep=True)
+
+        self.min_MonthlyDebt = df[df.MonthlyDebt > 0.1].MonthlyDebt.min()
+        self.max_MonthsLastDel = df.MonthsSinceLastDelinquent.quantile(0.995)
+
+        # колонки для кластеризации
+        self.tsne_columns = [col for col in df.columns if
+                             col not in self.exclude_columns + [
+                                 'CreditDefault']]
 
         if num_debt_bins > 3:
             self.num_debt_bins = num_debt_bins
@@ -535,17 +688,42 @@ class DataProcessing(ReadWriteDataset):
                                     precision=0, retbins=True)
         self.debt_bins[0] = -np.inf
         self.debt_bins[-1] = np.inf
-        self.debt_labels = [self.alphabet[i] for i in range(num_debt_bins)]
+        self.debt_labels = [self.alphabet[i] for i in
+                            range(self.num_debt_bins)]
+
+        if num_history_bins > 2:
+            self.num_history_bins = num_history_bins
+        # возвращается кортеж:
+        # _, self.history_bins = pd.qcut(df.YearsOfCreditHistory,
+        #                                q=self.num_history_bins,
+        #                                precision=0, retbins=True)
+        _, self.history_bins = pd.cut(df.YearsOfCreditHistory,
+                                      bins=self.num_history_bins,
+                                      precision=0, retbins=True)
+        self.history_bins[0] = -np.inf
+        self.history_bins[-1] = np.inf
+        self.history_labels = [self.alphabet[i] for i in
+                               range(self.num_history_bins)]
 
         # небольшой препроцессинг, который нужен в двух методах fit и transform
         df = self.preprocess_df(df)
+
+        self.YearsInCurrentJob = int(df.YearsInCurrentJob.mode()[0])
+
+        # медианный YearsInCurrentJob по группам history_group
+        self.med_history_job = df.groupby('history_group').agg(
+            {'YearsInCurrentJob': 'median'})
+        self.med_history_job.fillna(self.YearsInCurrentJob, inplace=True)
+        self.med_history_job = self.med_history_job.astype('int').to_dict()[
+            'YearsInCurrentJob']
+        # print(self.YearsInCurrentJob, self.med_history_job)
 
         # Расчет медиан
         self.medians = df.median()
 
         # медианный AnnualIncome по группам debt_group
         self.med_debt_income = df.groupby('debt_group').agg(
-            {'AnnualIncome': 'median'}).to_dict()['AnnualIncome']
+            {'AnnualIncome': 'median'}).round(0).to_dict()['AnnualIncome']
         # print(self.med_debt_income)
 
         # медианный CreditScore по группам NumberOfCreditProblems
@@ -554,156 +732,314 @@ class DataProcessing(ReadWriteDataset):
         self.med_problems_score[3] -= 10
         # print(self.med_problems_score)
 
-        self.YearsInCurrentJob = df.YearsInCurrentJob.mode()[0]
-
-        features_isna = {'AnnualIncome': ~df.AnnualIncome.isna(),
-                         'CurrentLoanAmount': df.CurrentLoanAmount < 99999999,
-                         'CreditScore': ~df.CreditScore.isna()}
-        for name_feature, cond in features_isna.items():
-            print(name_feature)
-            # группировка признака по группам Purpose и debt_group
-            for col_groupby in ('Purpose', 'debt_group',
-                                'NumberOfCreditProblems'):
-                grp_feat = df[cond].groupby(col_groupby, as_index=False).agg(
+        feats_isna = {'AnnualIncome': 'ai_',
+                      'CurrentLoanAmount': 'cla_',
+                      'CreditScore': 'cs_',
+                      'calc_months': 'cm_',
+                      'MonthsSinceLastDelinquent': 'mld_'
+                      }
+        # file = open(os.path.join(PATH_EXPORT, 'groups.txt'), 'w')
+        for name_feature, feat in feats_isna.items():
+            cond = ~df[name_feature].isna()
+            # print(name_feature)
+            # группировка признака по Purpose, debt_group, NumberOfCrdProblems
+            for col_grpby in self.cat_groups:
+                grp_feat = df[cond].groupby(col_grpby, as_index=False).agg(
                     {name_feature: ['median', 'mean']})
-                grp_feat.columns = [col_groupby, 'feat_median', 'feat_mean']
-                grp_feat['feat_med_mean'] = grp_feat.mean(axis=1)
+                n_cols = [col_grpby, f'{feat}median', f'{feat}mean']
+                grp_feat.columns = n_cols
+                if name_feature == 'CreditScore' and \
+                        col_grpby == 'NumberOfCreditProblems':
+                    grp_feat.loc[3, 'cs_median'] -= 10
+                grp_feat[f'{feat}med_mean'] = grp_feat[n_cols[1:]].mean(axis=1)
                 grp_feat = grp_feat.round(0)
-                grp_feat = grp_feat.set_index(col_groupby)
-                for attr in ('feat_median', 'feat_mean', 'feat_med_mean'):
-                    name_atr = f'{col_groupby}_{attr}'
-                    name_grp = grp_feat[attr]
+                if name_feature == 'CreditScore':
+                    cols = grp_feat.columns.values[1:]
+                    grp_feat.loc[:, cols] = grp_feat.loc[:, cols].astype('int')
+                    # print(grp_feat)
+                grp_feat = grp_feat.set_index(col_grpby)
+                for atr in (f'{feat}median', f'{feat}mean', f'{feat}med_mean'):
+                    name_atr = f'{col_grpby}_{atr}'
+                    name_grp = grp_feat[atr]
                     name_grp.columns = [name_feature]
                     name_grp = name_grp.to_dict()
                     setattr(DataProcessing, name_atr, name_grp)
-                    print(name_atr)
-                    print(name_grp)
+                    # if name_feature == 'calc_months':
+                    #     print(name_atr)
+                    #     print(name_grp)
+                    # file.write(f'{name_atr}\n')
+        # file.close()
+
+        # группировки для Target encoding
+        cond = (df.Learn == 1)
+        all_groups = [''] + self.cat_groups
+        for idx_one, grp_one in enumerate(all_groups):
+            for grp_two in all_groups[idx_one + 1:]:
+                if grp_one:
+                    col_grpby = [grp_one] + [grp_two]
+                else:
+                    col_grpby = [grp_two]
+                name_one = f'TargetEnc_{grp_one}'
+                name_atr = '_'.join(['TargetEnc'] + col_grpby)
+                # print('имена', col_grpby, name_atr)
+                grp_feat = df[cond].groupby(col_grpby, as_index=False).agg(
+                    {'CreditDefault': 'mean'}).rename(
+                    columns={'CreditDefault': name_atr})
+                if len(col_grpby) > 1:
+                    # заполнение нулей в группировке по двум полям из
+                    # вышестоящей группировки, т.е. по первому полю
+                    grp_feat = grp_feat.merge(
+                        getattr(DataProcessing, name_one), on=grp_one,
+                        how='left')
+                    grp_feat.loc[grp_feat[name_atr] > 0.001, name_one] = 0
+                    grp_feat[name_atr] = grp_feat[[name_atr, name_one]].sum(
+                        axis=1)
+                    grp_feat.drop(name_one, axis=1, inplace=True)
+                setattr(DataProcessing, name_atr, grp_feat)
+
+    def make_target_encoding(self, df_in):
+        """
+        добавление колонок по Target encoding
+        :param df_in: входной ДФ
+        :return: выходной ДФ
+        """
+        df = df_in.copy(deep=True)
+
+        all_groups = [''] + self.cat_groups
+        for idx_one, grp_one in enumerate(all_groups):
+            for grp_two in all_groups[idx_one + 1:]:
+                if grp_one:
+                    col_grpby = [grp_one] + [grp_two]
+                else:
+                    col_grpby = [grp_two]
+                name_one = f'TargetEnc_{grp_one}'
+                name_atr = '_'.join(['TargetEnc'] + col_grpby)
+                # print('имена', col_grpby, name_atr)
+                grp_feat = getattr(DataProcessing, name_atr)
+                self.target_encoding_feats.append(name_atr)
+                df = df.merge(grp_feat, on=col_grpby, how='left')
+                if len(col_grpby) > 1 and df[name_atr].isna().sum() > 0:
+                    # заполнение пропусков в новой фиче по двум полям из
+                    # вышестоящей группировки, т.е. по первому полю
+                    df.loc[df[name_atr].isna(), name_atr] = df.loc[
+                        df[name_atr].isna(), name_one]
+        # print('новые фичи', self.target_encoding_feats)
+        # print('пропуски', df.TargetEnc_grp_purpose_debt_group.isna().sum())
+        # print(df[df.TargetEnc_grp_purpose_debt_group.isna()])
+        return df
 
     @staticmethod
-    def fill_ai_cla_cs(df_in, num_pos, indexes_isna):
+    def fill_ai_cla_cs(df_in, num_pos):
         """
         Заполнение 'AnnualIncome', 'CurrentLoanAmount', 'CreditScore'
         на основе предсказаний модели
         :param df_in: входной ДФ
         :param num_pos: порядковый номер колонки для предсказаний
-        :param indexes_isna: индексы пропущенных значений
         :return: ДФ
         """
         df_lrn = df_in.copy(deep=True)
 
-        # эти колонки исключаем из обучения
-        excld_cols = ['AnnualIncome', 'CurrentLoanAmount', 'CreditScore']
-        group_cols = ['HomeOwnership', 'grp_purpose', 'debt_group']
+        target_enc_feats = {0: ['debt_group_ai_median'],
+                            1: ['NumberOfCreditProblems_cla_median',
+                                'grp_purpose_cla_median'],
+                            2: ['grp_purpose_cs_median']}
+
+        # признаки с отметками пропущенных значений
+        feats_isna = ['AnnualIncomeIsGood', 'CurrentLoanAmountIsGood',
+                      'CreditScoreIsGood']
+        # колонка с метками пропущенных значений
+        isna_column = feats_isna[num_pos]
+
+        # признаки с пропущенными значениями
+        feats_cols = ['AnnualIncome', 'CurrentLoanAmount', 'CreditScore']
         # колонка для предсказаний
-        target_column = excld_cols[num_pos]
-        dummy_dict = {0: ['HomeOwnership', 'grp_purpose'],
-                      1: ['grp_purpose'],
-                      2: ['HomeOwnership', 'grp_purpose', 'debt_group']}
-        models = {0: LGBMRegressor(learning_rate=0.075, max_depth=3,
-                                   n_estimators=140, num_leaves=63,
-                                   random_state=SEED),
-                  1: LGBMRegressor(learning_rate=0.05, max_depth=3,
-                                   n_estimators=180, num_leaves=63,
-                                   random_state=SEED),
-                  2: LGBMRegressor(learning_rate=0.1, max_depth=3,
-                                   n_estimators=140, num_leaves=63,
-                                   random_state=SEED)}
-        if num_pos < 2:
-            df_lrn.loc[df_lrn.CurrentLoanAmount >= 99999999,
-                       'CurrentLoanAmount'] = np.NaN
+        target_column = feats_cols[num_pos]
+
+        # очистка существующих значений в колонке с пропущенными значениями
+        df_lrn.loc[df_lrn[isna_column] < 1, target_column] = np.NaN
+
+        # колонки для группировки
+        group_cols = ['HomeOwnership', 'grp_purpose', 'debt_group',
+                      'rest_bal_group']
+
+        prfx_dict = {0: '_ai_me', 1: '_cla_me', 2: '_cs_me'}
 
         features_gen = NewTargetFeature()
-        features_gen.fit(indexes_isna)
-        df_lrn = features_gen.transform(df_lrn, exclude_cols=group_cols,
-                                        dummy_cols=dummy_dict[num_pos])
+        df_lrn = features_gen.transform(df_lrn,
+                                        exclude_cols=feats_isna + TargetEnc)
         df_lrn = memory_compression(df_lrn)
 
+        # категорийные колонки
+        learn_cats = features_gen.cat_features + group_cols
+        # learn_cats = []  # убрать категории
+        learn_cats.append('Purpose')
         # все колонки для обучения
         learn_cols = features_gen.learn_columns
+        # уберем более колонки про кредит и метку обучения
+        lrn_exclude = ['CreditDefault']
         # уберем более крупные группировки
-        lrn_exclude = []
+        # lrn_exclude.extend(group_cols)  # убрать категории
         lrn_exclude.extend(features_gen.exclude_columns)
-        lrn_exclude.extend(excld_cols[num_pos:])
-        # колонки для обучения
-        mdl_columns = [col for col in learn_cols if col not in lrn_exclude]
-        mdl_columns.append(target_column)
+        lrn_exclude.append(target_column)
+        print('Исключаем:', lrn_exclude)
 
-        train_lrn = df_lrn[df_lrn.Learn == 1]
+        target_feats = [col for col in learn_cols if prfx_dict[num_pos] in col]
+        print('target_feats', target_feats)
+
+        # колонки для обучения
+        mdl_columns = [col for col in learn_cols if col not in lrn_exclude and
+                       prfx_dict[num_pos] not in col]
+        mdl_columns.append(target_column)
+        mdl_columns.append(isna_column)
+        mdl_columns.extend(target_enc_feats[num_pos])
+        learn_cats = [col for col in learn_cats if col in mdl_columns]
+
+        train_lrn = df_lrn.copy(deep=True)
+        # print(train_lrn.info())
 
         # обучающий датасет
-        train_lrn = train_lrn[~train_lrn[target_column].isna()][mdl_columns]
+        train_lrn = train_lrn[train_lrn[isna_column] > 0][mdl_columns]
+        train_lrn.drop(isna_column, axis=1, inplace=True)
         # тестовый датасет
-        test_lrn = df_lrn[indexes_isna][mdl_columns]
-        test_lrn.drop(target_column, axis=1, inplace=True)
+        test_lrn = df_lrn[df_lrn[isna_column] < 1][mdl_columns]
+        test_lrn.drop([target_column, isna_column], axis=1, inplace=True)
 
         X_lrn = train_lrn.drop(target_column, axis=1)
-        y_lrn = train_lrn[target_column]
+        y_lrn = train_lrn[target_column].astype('float32')
 
+        models = {0: CatBoostRegressor(max_depth=4, random_state=SEED,
+                                       cat_features=learn_cats,
+                                       iterations=390, eval_metric='R2',
+                                       early_stopping_rounds=30, ),
+                  1: CatBoostRegressor(max_depth=3, random_state=SEED,
+                                       cat_features=learn_cats,
+                                       iterations=270, eval_metric='R2',
+                                       early_stopping_rounds=30, ),
+                  2: CatBoostRegressor(max_depth=4, random_state=SEED,
+                                       cat_features=learn_cats,
+                                       iterations=750, eval_metric='R2',
+                                       early_stopping_rounds=30, )}
         target_model = models[num_pos]
         target_model.fit(X_lrn, y_lrn)
         target_pred = target_model.predict(test_lrn)
+        print(f'best_score: {target_model.best_score_}')
         return target_pred
 
-    def transform(self, df_in, dummy_cols=[], exclude_cols=[]):
+    def get_names(self, prefix, idx_group, idx_attribute):
+        name_group_idx = self.cat_groups[idx_group]
+        name_attributes = [f'{name_group_idx}_{prefix}_median',
+                           f'{name_group_idx}_{prefix}_mean',
+                           f'{name_group_idx}_{prefix}_med_mean']
+        return name_group_idx, name_attributes[idx_attribute]
+
+    def transform(self, df_in, clusters=0, dummy_cols=[], exclude_cols=[],
+                  idx_grp=0, idx_attr=0):
         """
         Трансформация данных
         :type df_in: входной ДФ
+        :param clusters: делить данные на количество кластеров
         :param dummy_cols: категорийные колонки для преобразования в признаки
         :param exclude_cols: колонки не участвующие в обработке
+        :param idx_grp: индекс признака для группировки
+        :param idx_attr: индекс атрибута для группировки
         :return: ДФ
         """
+        if idx_grp not in range(len(self.cat_groups)):
+            idx_grp = 0
+        if idx_attr not in range(3):
+            idx_attr = 0
         self.dummy = dummy_cols
         df = df_in.copy(deep=True)
 
         # небольшой препроцессинг, который нужен в двух методах fit и transform
         df = self.preprocess_df(df)
 
-        # YearsInCurrentJob заполняем модой
-        df.loc[df.YearsInCurrentJob.isna(),
-               'YearsInCurrentJob'] = self.YearsInCurrentJob
-        # YearsInCurrentJob преобразуем в числовые значения
-        df.YearsInCurrentJob = df.YearsInCurrentJob.map(self.bin_years)
+        # Target encoding
+        # с ним стало хуже
+        df = self.make_target_encoding(df)
+
+        cond = df.YearsInCurrentJob.isna()
+        # # YearsInCurrentJob заполняем модой
+        # df.loc[cond, 'YearsInCurrentJob'] = self.YearsInCurrentJob
+        # self.comment.append(f'YearsInCurrentJob=moda, '
+        #                     f'bins={self.num_history_bins}')
+        # YearsInCurrentJob заполняем медианой по группам кредитной истории
+        df.loc[cond, 'YearsInCurrentJob'] = df[cond]['history_group'].map(
+            self.med_history_job)
+        self.comment.append(f'YearsInCurrentJob=med_history_job, '
+                            f'bins={self.num_history_bins}')
 
         # Bankruptcies заполняем нулями
         df.loc[df.Bankruptcies.isna(), 'Bankruptcies'] = 0
 
-        # MonthsSinceLastDelinquent заполняем нулями
-        df.loc[df.MonthsSinceLastDelinquent.isna(),
-               'MonthsSinceLastDelinquent'] = 0
+        # отметка, что эти поля изначально были заполнены
+        for column in self.features_good:
+            df[column] = 1
 
-        # датасет для моделей по AnnualIncome, CurrentLoanAmount, CreditScore
-        self.write_dataset(df, os.path.join(PATH_EXPORT, 'to_learn_ai.csv'))
+        # посмотреть на каком усреднении будет выше F1_score
+        # ['Purpose', 'debt_group', 'rest_bal_group', 'NumberOfCreditProblems']
+        # [median, mean, med_mean]
+        # подбор этих параметров
+
+        # # MonthsSinceLastDelinquent заполняем нулями
+        cond = df.MonthsSinceLastDelinquent.isna()
+        # df.loc[cond, 'MonthsSinceLastDelinquent'] = 0
+        # self.comment.append('MonthsSinceLastDelinquent = 0')
+        # # Попробовать заполнить min, max, mean, median, mode - хуже "0"
+        # df.loc[cond, 'MonthsSinceLastDelinquent'] =
+        # df.MonthsSinceLastDelinquent.mode()
+        # self.comment.append('MonthsSinceLastDelinquent = mode')
+        # # MonthsSinceLastDelinquent - заполним медианным значением по целям
+        # # и сроку кредита
+        # name_group, name_attribute = self.get_names('mld', idx_grp, idx_attr)
+        name_group, name_attribute = self.get_names('mld', 2, 0)
+        df.loc[cond, 'MonthsSinceLastDelinquent'] = df[cond][name_group].map(
+            getattr(DataProcessing, name_attribute))
+        self.comment.append(name_attribute)
+        # # если не получилось заполнить по группировке - заполним медианой
+        df.MonthsSinceLastDelinquent.fillna(
+            df.MonthsSinceLastDelinquent.median(), inplace=True)
+
+        # calc_months - заполним медианным значением по целям и сроку кредита
+        # по calc_months посчитать AnnualIncome = calc_months * MonthlyDebt
+        cond = df.calc_months.isna()
+        df.loc[cond, 'calc_monthsIsGood'] = 0
+        # name_group, name_attribute = self.get_names('cm', idx_grp, idx_attr)
+        name_group, name_attribute = self.get_names('cm', 0, 0)
+        df.loc[cond, 'calc_months'] = df[cond][name_group].map(
+            getattr(DataProcessing, name_attribute))
+        self.comment.append(name_attribute)
+        # если не получилось заполнить по группировке - заполним медианой
+        df.calc_months.fillna(df.calc_months.median(), inplace=True)
 
         # AnnualIncome - заполним медианным доходом по группам долга
         cond = df.AnnualIncome.isna()
-        df.loc[cond, 'AnnualIncome'] = df[cond].debt_group.map(
-            self.med_debt_income)
-        # предсказание на модели дает худший результат, чем группировка
-        # df.loc[cond, 'AnnualIncome'] = self.fill_ai_cla_cs(df, 0, cond)
-        self.write_dataset(df, os.path.join(PATH_EXPORT, 'to_learn_cla.csv'))
-
-        # CurrentLoanAmount замена значений 99999999
-        # посмотреть на каком усреднении будет выше F1_score
-        cond = df.CurrentLoanAmount >= 99999999
-        # CurrentLoanAmount замена значений 99999999 на медиану по Purpose
-        # name_atr = 'Purpose_feat_median'
-        # name_atr = 'Purpose_feat_mean'
-        name_atr = 'Purpose_feat_med_mean'
-        # CurrentLoanAmount замена значений 99999999 на медиану по debt_group
-        # name_atr = 'debt_group_feat_median'
-        # name_atr = 'debt_group_feat_mean'
-        # name_atr = 'debt_group_feat_med_mean'
-        df.loc[cond, 'CurrentLoanAmount'] = df[cond].Purpose.map(
-            getattr(DataProcessing, name_atr))
-        # print(df[cond][['Purpose', 'CurrentLoanAmount']])
-        # print(df[cond][['debt_group', 'CurrentLoanAmount']])
+        df.loc[cond, 'AnnualIncomeIsGood'] = 0
+        # df.loc[cond, 'AnnualIncome'] = df[cond].debt_group.map(
+        #     self.med_debt_income)
+        # name_group, name_attribute = self.get_names('ai', idx_grp, idx_attr)
+        name_group, name_attribute = self.get_names('ai', 1, 0)
+        df.loc[cond, 'AnnualIncome'] = df[cond][name_group].map(
+            getattr(DataProcessing, name_attribute))
+        self.comment.append(name_attribute)
+        # по calc_months посчитать AnnualIncome = calc_months * MonthlyDebt
+        # df.loc[cond, 'AnnualIncome'] = df[cond].calc_months * df[
+        #     cond].MonthlyDebt
+        # self.comment.append('ai = cm * MonthlyDebt')
         # если не получилось заполнить по группировке - заполним медианой
-        df.loc[df.CurrentLoanAmount >= 99999999, 'CurrentLoanAmount'] = np.NaN
+        df.AnnualIncome.fillna(df.AnnualIncome.median(), inplace=True)
+
+        # CurrentLoanAmount замена значений 99999999 - теперь они NaN
+        cond = df.CurrentLoanAmount.isna()
+        df.loc[cond, 'CurrentLoanAmountIsGood'] = 0
+        # name_group, name_attribute = self.get_names('cla', idx_grp, idx_attr)
+        name_group, name_attribute = self.get_names('cla', 0, 2)
+        df.loc[cond, 'CurrentLoanAmount'] = df[cond][name_group].map(
+            getattr(DataProcessing, name_attribute))
+        self.comment.append(name_attribute)
+        # если не получилось заполнить по группировке - заполним медианой
         df.CurrentLoanAmount.fillna(df.CurrentLoanAmount.median(),
                                     inplace=True)
-        # предсказание на модели дает худший результат, чем группировка
-        # df.loc[cond, 'CurrentLoanAmount'] = self.fill_ai_cla_cs(df, 1, cond)
-        self.write_dataset(df, os.path.join(PATH_EXPORT, 'to_learn_cs.csv'))
 
         # как-то нужно заполнить пропуски в CreditScore
         # простой вариант - максимальный рейтинг
@@ -712,25 +1048,62 @@ class DataProcessing(ReadWriteDataset):
         # df.CreditScore.fillna(df.CreditScore.median(), inplace=True)
         # третий вариант - мадиана по группам NumberOfCreditProblems
         cond = df.CreditScore.isna()
-        df.loc[cond, 'CreditScore'] = df[cond].NumberOfCreditProblems.map(
-            self.med_problems_score)
-        # предсказание на модели дает худший результат, чем группировка
-        # df.loc[cond, 'CreditScore'] = self.fill_ai_cla_cs(df, 2, cond)
-        df.CreditScore = df.CreditScore.astype(int)
+        df.loc[cond, 'CreditScoreIsGood'] = 0
+        # df.loc[cond, 'CreditScore'] = df[cond].NumberOfCreditProblems.map(
+        #     self.med_problems_score)
+        # name_group, name_attribute = self.get_names('cs', idx_grp, idx_attr)
+        name_group, name_attribute = self.get_names('cs', 3, 0)
+        df.loc[cond, 'CreditScore'] = df[cond][name_group].map(
+            getattr(DataProcessing, name_attribute))
+        self.comment.append(name_attribute)
+        # если не получилось заполнить по группировке - заполним медианой
+        df.CreditScore.fillna(df.CreditScore.median(), inplace=True)
+
+        # сохранение ДФ для отдельного обучения моделек на заполнение пропусков
+        self.write_dataset(df, os.path.join(PATH_EXPORT, 'to_learn_all.csv'))
+
+        # # заполнение таргет-енкодингд для моделек
+        # num_pos = 2
+        # pref = ['ai', 'cla', 'cs'][num_pos]
+        # for g_id in range(len(self.cat_groups)):
+        #     for a_id in range(3):
+        #         name_group, name_attribute = self.get_names(pref, g_id, a_id)
+        #         df[name_attribute] = df[name_group].map(
+        #             getattr(DataProcessing, name_attribute))
+        #         self.exclude_columns.append(name_attribute)
+        #         cond = df[name_attribute].isna()
+        #         df.loc[cond, name_attribute] = df.loc[cond, 'AnnualIncome']
+        # #
+        # # датасет для моделек по AnnualIncome, CurrentLoanAmount, CreditScore
+        # self.write_dataset(df, os.path.join(PATH_EXPORT, 'to_learn_all.csv'))
+        # #
+        # # колонка с метками пропущенных значений
+        # isna_column = self.features_good[num_pos]
+        # cond = df[isna_column] < 1
+        # #
+        # # предсказание на модели дает худший результат, чем группировка
+        # df.loc[cond, 'AnnualIncome'] = self.fill_ai_cla_cs(df, num_pos)
+        # # предсказание на модели дает худший результат, чем группировка
+        # df.loc[cond, 'CurrentLoanAmount'] = self.fill_ai_cla_cs(df, num_pos)
+        # # предсказание на модели дает худший результат, чем группировка
+        # df.loc[cond, 'CreditScore'] = self.fill_ai_cla_cs(df, num_pos)
+        # df.CreditScore = df.CreditScore.astype(int)
 
         # на всякий случай, если что-то пошло не так
         df.fillna(self.medians, inplace=True)
 
         # Добавление новых признаков
         df = self.new_features(df)
-        df.loc[df.TaxLiens > 0, 'TaxLiens'] = 1
-        df.loc[df.NumberOfCreditProblems > 0, 'NumberOfCreditProblems'] = 1
+
+        if clusters:
+            cluster_labels = self.make_clusters(df, clusters)
+            df = pd.concat([df, cluster_labels], axis=1)
 
         # деление категорий по столбцам
         if self.dummy:
             df_dummy = pd.get_dummies(df[self.dummy], columns=self.dummy)
             df = pd.concat([df, df_dummy], axis=1)
-            # self.cat_features.extend(df_dummy.columns.values)
+            self.cat_features.extend(df_dummy.columns.values)
             self.exclude_columns.extend(self.dummy)
 
         # для категорийных признаков установим тип данных 'category'
@@ -748,53 +1121,69 @@ class DataProcessing(ReadWriteDataset):
         return df
 
 
-if __name__ == "__main__":
+def make_model(idx_grp, idx_attr, target_enc_feat='', multy_feature='',
+               clusters=0, es_groups=[], num_history_bins=7):
+    """
+    Построение модели
+    :param num_history_bins: делить кредитную историю на кол-во частей
+    :param es_groups: список признаков для добавления новых фич
+    :param idx_grp: индекс группы ['grp_purpose', 'debt_group',
+           'rest_bal_group', 'NumberOfCreditProblems', 'HomeOwnership']
+    :param idx_attr: индекс метрики [median, mean, med_mean]
+    :param clusters: делить данные на количество кластеров
+    :param target_enc_feat: колонка с таргетенкодингом
+    :param multy_feature: колонка на которую умножается target_enc_feature
+    :return: None
+    """
+    global processor_data, dataset, model_columns, test_df, X, y
+    global X_train, X_valid, y_train, y_valid, category_columns, learn_exclude
+    model_columns = category_columns = learn_exclude = []
+
     # обучающая выборка
     train = pd.read_csv(FILE_TRAIN)
     # тестовая выборка
     test = pd.read_csv(FILE_TEST)
 
     processor_data = DataProcessing()
+    # удобнее работать с одним ДФ: отображать, сохранять, читать
     dataset = processor_data.concat_df(train, test)
 
-    # NUM_FEATURE_NAMES = dataset.select_dtypes(
-    #     include='float64').columns.values.tolist() + dataset.select_dtypes(
-    #     include='int32').columns.values.tolist()
-    # NUM_FEATURE_NAMES.remove('CreditDefault')
-    # print(NUM_FEATURE_NAMES)
-    # for col in NUM_FEATURE_NAMES:
-    #     plt.figure(figsize=(8, 4))
-    #     sns.kdeplot(data=dataset, x=col, shade=True, hue='Learn',
-    #                 hue_order=[1, 0])
-    #     print(col)
-    #     print(mannwhitneyu(dataset[dataset.Learn == 1][col],
-    #                        dataset[dataset.Learn == 0][col]))
-    #     plt.title(col)
-    #     plt.show()
-
-    # CAT_FEATURE_NAMES = dataset.select_dtypes(
-    #     include='object').columns.values.tolist()
-    # print(CAT_FEATURE_NAMES)
-    # num_feature = 'CurrentCreditBalance'
-    # for col in CAT_FEATURE_NAMES:
-    #     sns.set(font_scale=1.1)
-    #     fig, ax = plt.subplots(figsize=(16, 6))
-    #     sns.pointplot(data=dataset, x=col, y=num_feature, capsize=.1,
-    #                   shade=True, hue='Learn', hue_order=[1, 0])
-    #     plt.title(col)
-    #     plt.setp(ax.get_xticklabels(), rotation=90)
-    #     plt.tight_layout()
-    #     plt.show()
+    # for col in dataset.select_dtypes(include='float64').columns:
+    #     print(f'Признак: {col}')
+    #     delta = 0.001
+    #     min_quant = dataset[col].quantile(delta)
+    #     max_quant = dataset[col].quantile(1 - delta)
+    #     print(f'< квантиля {delta:0.1%} кол-во значений: '
+    #           f'{len(dataset[dataset[col] < min_quant])}, '
+    #           f'> квантиля {1 - delta:0.1%} кол-во значений: '
+    #           f'{len(dataset[dataset[col] > max_quant])}')
 
     print(f'Обработка данных')
     start_time = time.time()
-    processor_data.fit(dataset, num_debt_bins=7)
-    exclude_columns = ['HomeOwnership', 'grp_purpose']
-    dataset = processor_data.transform(dataset,
-                                       exclude_cols=exclude_columns)
+    # статистики по всему датасету
+    processor_data.fit(dataset, num_debt_bins=7,
+                       num_history_bins=num_history_bins)
+    # # статистики только на трейне
+    # processor_data.fit(dataset[dataset.Learn == 1], num_debt_bins=7,
+    #                    num_history_bins=num_history_bins)
+
+    exclude_columns = ['HomeOwnership', 'grp_purpose', 'debt_group',
+                       'rest_bal_debt', 'rest_bal_group',
+                       'history_group'
+                       ]
+
+    # exclude_columns.extend(['calc_months', 'purpose_term'])
+    exclude_columns.extend(['purpose_term'])
+    # exclude_columns.extend(['calc_months'])
+
+    dataset = processor_data.transform(dataset, clusters=clusters,
+                                       exclude_cols=exclude_columns,
+                                       dummy_cols=[],
+                                       idx_grp=idx_grp,
+                                       idx_attr=idx_attr)
     processor_data.write_dataset(dataset, FILE_WITH_FEATURES)
     print_time(start_time)
-
+    print('Пропуски заполнены по группировкам: ', processor_data.comment)
     dataset = memory_compression(dataset)
 
     # если есть пустые значения - выведем на экран
@@ -802,25 +1191,124 @@ if __name__ == "__main__":
         print(dataset.drop(['CreditDefault'], axis=1).isna().sum())
 
     cat_features = processor_data.cat_features
+    # cat_features.append('history_group')
     # все колонки для обучения
     learn_columns = processor_data.learn_columns
 
+    print('CatGroups:', processor_data.cat_groups)
+    print('TargetEnc:', processor_data.target_encoding_feats)
+
     # эти колонки исключаем из обучения
-    add_exclude = []
+    # add_exclude = []
+    add_exclude = TargetEnc
+    # колонки с отметками о заполненности полей
+    add_exclude.extend(processor_data.features_good)
 
     # уберем более крупные группировки
     learn_exclude = []
     learn_exclude.extend(processor_data.exclude_columns)
     learn_exclude.extend(add_exclude)
-    print(learn_exclude)
+    # если это убрать результат становится хуже
+    # learn_exclude.append('MonthsSinceLastDelinquent')
+    print('Исключаем:', learn_exclude)
 
     # колонки для обучения
-    model_columns = [col for col in learn_columns if col not in learn_exclude]
-    category_columns = [col for col in cat_features if col in model_columns]
-    print(model_columns)
-    print(category_columns)
+    model_columns = [col for col in learn_columns if
+                     col not in learn_exclude]
+    category_columns = [col for col in cat_features if
+                        col in model_columns]
 
-    print(dataset.info())
+    if target_enc_feat in learn_columns:
+        if multy_feature:
+            new_feat = f'{target_enc_feat}_mult_CreditScore'
+            dataset[new_feat] = dataset[target_enc_feat] * dataset.CreditScore
+        else:
+            new_feat = target_enc_feat
+        model_columns.insert(0, new_feat)
+        print('Добавляем:', new_feat)
+    elif target_enc_feat == 'AllTargetEnc':
+        model_columns.extend(processor_data.target_encoding_feats)
+
+    print('Обучаемся:', model_columns)
+    print('Категории:', category_columns)
+
+    # print(dataset.info())
+
+    if len(es_groups):
+        print(f'Генерация новых признаков по {es_groups}')
+        start_time = time.time()
+
+        agg_primitives = ['median', 'mode', 'num_unique', 'mean', 'sum',
+                          'percent_true', 'count', 'std']
+
+        processor_data.comment.append({'featuretools': (es_groups,
+                                                        agg_primitives)})
+
+        # creating and entity set 'es'
+        all_cat_groups = processor_data.cat_groups
+        es = ft.EntitySet(id='Credits')
+        es_cat_cols = [col for col in all_cat_groups if
+                       col not in model_columns]
+        # добавим колонку с индексом
+        dataset.insert(0, 'ID', dataset.index)
+        variable_types = {col: vtypes.Categorical for col in all_cat_groups if
+                          col != 'NumberOfCreditProblems'}
+        es_dataset_cols = ['Learn'] + es_cat_cols + model_columns
+        # print(es_dataset_cols)
+        # добавим колонки с target_encoding
+        # es_dataset_cols.extend(processor_data.target_encoding_feats)
+        # print(es_dataset_cols)
+        es.entity_from_dataframe(entity_id='Clients',
+                                 dataframe=dataset[es_dataset_cols],
+                                 index='ID',
+                                 variable_types=variable_types)
+
+        for es_group in es_groups:
+            es = es.normalize_entity(base_entity_id='Clients',
+                                     new_entity_id=es_group, index=es_group)
+            feats_matrix, feat_names = ft.dfs(entityset=es,
+                                              target_entity='Clients',
+                                              agg_primitives=agg_primitives,
+                                              verbose=3)
+            feats_matrix_enc, feats_enc = ft.encode_features(feats_matrix,
+                                                             feat_names,
+                                                             include_unknown=False)
+        print_time(start_time)
+
+        # по этим колонкам не нужны новые признаки
+        drop_cols = [col for col in feats_matrix_enc.columns if
+                     '.Learn' in col or '.CreditDefault' in col]
+        feats_matrix_enc.drop(drop_cols, axis=1, inplace=True)
+        print('Размер нового датасета:', feats_matrix_enc.shape)
+        with open(os.path.join(PATH_EXPORT, 'matrix_cols.csv'), 'w') as fm:
+            for col in feats_matrix_enc.columns:
+                fm.write(f'{col}\n')
+
+        # удаление признаков с высокой корреляцией
+        # Threshold for removing correlated variables
+        threshold = 0.8
+        # Absolute value correlation matrix
+        corr_matrix = feats_matrix_enc.corr().abs()
+        corr_matrix_up = corr_matrix.where(np.triu(np.ones(corr_matrix.shape),
+                                                   k=1).astype(np.bool))
+        # Select columns with correlations above threshold
+        collinear_features = [column for column in corr_matrix_up.columns if
+                              any(corr_matrix_up[column] > threshold) and
+                              any(True for elem in agg_primitives if
+                                  elem.upper() in column)]
+        # убрать колонки с сильной корреляцией
+        # feats_matrix_enc.drop(collinear_features, axis=1, inplace=True)
+        #
+        model_columns = feats_matrix_enc.columns.to_list()[1:]
+        dataset = feats_matrix_enc.copy(deep=True)
+        for col in feats_matrix_enc.columns.to_list()[1:]:
+            if dataset[col].isna().sum() > 0 and col != 'CreditDefault':
+                print(f'Пропуски в {col} = {dataset[col].isna().sum()}')
+                model_columns.remove(col)
+                # print(dataset[col].describe())
+        with open(os.path.join(PATH_EXPORT, 'model_cols.csv'), 'w') as mc:
+            for col in model_columns:
+                mc.write(f'{col}\n')
 
     # обучающий датасет
     train_df = dataset[dataset.Learn == 1][model_columns]
@@ -836,9 +1324,8 @@ if __name__ == "__main__":
     print(f'{txt[0]}теста: {test_df.shape}{txt[1]}'
           f'{test_df.isna().sum().sum()}')
 
-    # было test_size=0.2
     X_train, X_valid, y_train, y_valid = train_test_split(X, y,
-                                                          test_size=0.2,
+                                                          test_size=0.3,
                                                           shuffle=True,
                                                           random_state=SEED,
                                                           stratify=y
@@ -853,112 +1340,75 @@ if __name__ == "__main__":
 
     imbalance = y_train.value_counts()[0] / y_train.value_counts()[1]
     print(f'Дисбаланс классов = {imbalance}')
-
-    # определение моделей
-    model = RandomForestClassifier(random_state=SEED)
-    # mdl = ExtraTreesClassifier(random_state=SEED)
-    # mdl = GradientBoostingClassifier(random_state=SEED, criterion='mse')
-    # mdl = LGBMClassifier(random_state=SEED, num_leaves=63)
-    # mdl = CatBoostClassifier(random_state=SEED, loss_function='RMSE',
-    #                           silent=True, cat_features=category_columns)
-
-    # find_depth(RandomForestClassifier)
-    # find_depth(ExtraTreesClassifier)
-    # find_depth(GradientBoostingClassifier)
-    # find_depth(LGBMClassifier, True)
-
-    # настройки для первого приближения: поиск глубины деревьев и количества фолдов
-    # f_params = {'max_depth': list(range(4, 15))}
-    f_params = {'max_depth': list(range(4, 9))}
-    # раскомментарить эту строку для расчета
-    # process_model(mdl, params=f_params, folds_range=list(range(3, 8)))
-
-    # models = []
-    # for depth in range(3, 11):
-    #     param = {'max_depth': [depth]}
-    #     mdl = process_model(mdl, params=param, folds_range=list(range(3, 6)))
-    #     models.append(mdl[0][:4])
-    # models.sort(key=lambda x: (-x[1], x[2]))
-    # print()
-    # for elem in models:
-    #     print(elem)
-
-    # Зададим параметры при max_depth = 18 для подбора параметров
-    # и отдыхаем несколько часов
-    f_params = {'n_estimators': list(range(100, 701, 100)),
-                'max_depth': [5],
-                # 'min_samples_leaf': list(range(1, 11, 1)),
-                # 'min_samples_split': list(range(2, 22, 1)),  # не меньше 2
-                }
-    # раскомментарить эту строку для расчета
-    # process_model(mdl, params=f_params, folds_range=[7], verbose=1)
+    print(f'Общий дисбаланс = {y.value_counts()[0] / y.value_counts()[1]}')
 
     # немного потюним и результат грузим на Kaggle
     feat_imp_df_ = pd.DataFrame
-
-    # # GradientBoostingRegressor
-    # f_params = {
-    #     # 'n_estimators': [1100],
-    #     'n_estimators': list(range(50, 151, 50)),
-    #     'max_depth': [4],
-    #     # 'learning_rate': [.05]
-    #     'learning_rate': [.005, .01, .025, .05]
-    #     # 'min_samples_leaf': list(range(1, 9, 2)),
-    #     # 'min_samples_split': list(range(2, 9, 2)),  # не меньше 2
-    #     # 'min_samples_leaf': [3],
-    #     # 'min_samples_split': [19]
-    # }
-
-    # f_params = {
-    #     'boosting_type': ['dart'],
-    #     # 'boosting_type': ['dart', 'gbdt'],
-    #     # 'n_estimators': [1000],
-    #     'n_estimators': list(range(900, 1301, 50)),
-    #     # 'max_bin': [512],
-    #     'max_depth': [5],
-    #     # 'learning_rate': [.05]
-    #     'learning_rate': [.005, .01, .025, .05, 0.1]
-    #     # 'min_samples_leaf': list(range(1, 9, 2)),
-    #     # 'min_samples_split': list(range(2, 9, 2)),  # не меньше 2
-    #     # 'min_samples_leaf': [3],
-    #     # 'min_samples_split': [19]
-    # }
-    # раскомментарить эту строку для расчета
-    # _, feat_imp_df_ = process_model(mdl, params=f_params, fold_single=5,
-    #                                 verbose=1, build_model=True)
-    # print(feat_imp_df_)
-
-    # model = CatBoostClassifier(silent=True, random_state=SEED,
-    #                            class_weights=[1, imbalance],
-    #                            eval_metric='F1')
-    # model.fit(X_train, y_train)
-    # evaluate_preds(model, X_train, X_valid, y_train, y_valid)
-
     params = {
-        # 'iterations': [5, 7, 10, 20, 30, 50, 100],
-        # 'max_depth': [3, 5, 7, 10],
-        'max_depth': range(5, 6),
-        'iterations': range(10, 151, 10),
+        # 'iterations': range(50, 901, 50),
+        'iterations': range(10, 201, 10),
+        'max_depth': range(5, 7),
         # 'learning_rate': [.005, .01, .025, .05]
     }
-    # поставил общий дисбаланс попробовать это грузануть
+    # поставил общий дисбаланс попробовать это на Каггле - результат хуже
     # imbalance = y.value_counts()[0] / y.value_counts()[1]
 
     model = CatBoostClassifier(silent=True, random_state=SEED,
                                class_weights=[1, imbalance],
                                cat_features=category_columns,
                                eval_metric='F1',
-                               early_stopping_rounds=50, )
+                               early_stopping_rounds=30,
+                               )
 
     feat_imp_df_ = process_model(model, params=params, fold_single=5,
                                  verbose=1, build_model=True)
     print(feat_imp_df_)
 
-    # skf = StratifiedKFold(n_splits=5, random_state=SEED, shuffle=True)
-    # search_cv = model.grid_search(params, X_train, y_train, cv=skf,
-    #                               stratified=True, refit=True)
-    # for key, value in model.get_all_params().items():
-    #     print(f'{key} : {value}'.format(key, value))
-    #
-    # a = model.get_all_params()['iterations']
-    # b = model.get_all_params()['depth']
+
+if __name__ == "__main__":
+
+    total_time = time.time()
+
+    tmp_class = DataProcessing()
+    tmp_group = ['median', 'mean', 'med_mean']
+    # ['grp_purpose', 'debt_group', 'rest_bal_group',
+    #  'NumberOfCreditProblems', 'HomeOwnership', 'purpose_term']
+    range_grp_idx = range(len(tmp_class.cat_groups))
+    # range_grp_idx = [0, 6]
+    # [median, mean, med_mean]
+    range_attr_idx = range(3)
+    # range_attr_idx = [0]
+    # перебор колонок с группировкой по метрикам - подобрал нужные метрики
+    # for grp_idx in range_grp_idx:
+    #     for attr_idx in range_attr_idx:
+    #         print(f'Группировка по {tmp_class.cat_groups[grp_idx]} '
+    #               f'метрика {tmp_group[attr_idx]}')
+    #         make_model(grp_idx, attr_idx)
+
+    # # перебор колонок с таргетенкодингом - не помогло
+    # for target_enc in TargetEnc:
+    #     # добавление колонки с таргет_енкодингом
+    #     make_model(0, 0, target_enc)
+    #     # добавление колонки с таргет_енкодингом * CreditScore
+    #     make_model(0, 0, target_enc, 'CreditScore')
+
+    # # перебор колонок с кластеризацией - не помогло
+    # for cluster in range(2, 33):
+    #     make_model(0, 0, clusters=cluster)
+
+    # # генерация новых фич с featuretools
+    # for num_new_groups in range(1, len(tmp_class.cat_groups) + 1):
+    #     for group_es in combinations(tmp_class.cat_groups, num_new_groups):
+    #         make_model(0, 0, es_groups=group_es)
+
+    # подбор на сколько частей делить кредитную историю для группировки = 7
+    # for num in range(3, 24):
+    #     make_model(0, 0, num_history_bins=num)
+
+    make_model(0, 0)
+
+    # cb_submit_210331201626.csv Private / Public : 0.66025 / 0.65404
+    # cb_submit_210331155924.csv Private / Public : 0.65473 / 0.62702
+    # cb_submit_210331160809.csv Private / Public : 0.65239 / 0.64625
+
+    print_time(total_time)
