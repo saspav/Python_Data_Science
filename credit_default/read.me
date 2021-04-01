@@ -1,21 +1,31 @@
-РљРѕСЂРЅРµРІРѕР№ РєР°С‚Р°Р»РѕРі РґР»СЏ РєСѓСЂСЃРѕРІРѕРіРѕ РїСЂРѕРµРєС‚Р° Credit Default
+Ваша задача этом соревновании - предсказать факт невыполнения кредитных обязательств в датасете test.csv. Вам будут даны два датасета: train.csv (содержит признаки и факт невыполнения кредитных обязательств) и test.csv (только признаки).
+The evaluation metric for this competition is F1-Score.
+The F1 metric weights recall and precision equally, and a good retrieval algorithm will maximize both precision and recall simultaneously. Thus, moderately good performance on both will be favored over extremely good performance on one and poor performance on the other.
+File descriptions
 
-train.csv - the training set
-test.csv - the test set
-sample_submission.csv - a sample submission file in the correct format
-credit_default.ipynb - РЅРѕСѓС‚Р±СѓРє СЃ РёcСЃР»РµРґРѕРІР°РЅРёРµРј РґР°РЅРЅС‹С… Рё РєРѕРґРѕРј СЃРєСЂРёРїС‚Р° credit_default.py
-credit_default.py - РѕСЃРЅРѕРІРЅРѕР№ СЃРєСЂРёРїС‚
-learn_mdl_ai.py - СЃРєСЂРёРїС‚ РѕР±СѓС‡РµРЅРёСЏ РјРѕРґРµР»Рё РґР»СЏ РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ AnnualIncome
-learn_mdl_cla.py - СЃРєСЂРёРїС‚ РѕР±СѓС‡РµРЅРёСЏ РјРѕРґРµР»Рё РґР»СЏ РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ CurrentLoanAmount
-learn_mdl_cs.py - СЃРєСЂРёРїС‚ РѕР±СѓС‡РµРЅРёСЏ РјРѕРґРµР»Рё РґР»СЏ РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ CreditScore
-credit_weird.py - СЃРєСЂРёРїС‚ РґР»СЏ РѕР±СЂР°Р±РѕС‚РєРё РІСЃРµС… РїСЂРµРґСЃРєР°Р·Р°РЅРёР№ Рё РїРѕР»СѓС‡РµРЅРёРµ РёС… РЅРёС… СЃСЂРµРґРЅРµРіРѕ.
-df_all.csv - С„Р°Р№Р» РїРѕСЃР»Рµ РїСЂРµРїСЂРѕС†РµСЃСЃРёРЅРіР° Рё РѕР±СЂР°Р±РѕС‚РєРё РґР°РЅРЅС‹С…
-df_all.pkl - С„Р°Р№Р» РїРѕСЃР»Рµ РїСЂРµРїСЂРѕС†РµСЃСЃРёРЅРіР° Рё РѕР±СЂР°Р±РѕС‚РєРё РґР°РЅРЅС‹С…
-to_learn_all.csv - РґР°С‚Р°СЃРµС‚ РґР»СЏ РјРѕРґРµР»РµРє РїРѕ AnnualIncome, CurrentLoanAmount, CreditScore
-to_learn_all.pkl - РґР°С‚Р°СЃРµС‚ РґР»СЏ РјРѕРґРµР»РµРє РїРѕ AnnualIncome, CurrentLoanAmount, CreditScore
-submission.csv - РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ РЅРѕСѓС‚Р±СѓРєР°
-cb_submit_210331201626.csv - РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ credit_default.py  Private / Public : 0.66025 / 0.65404
-cb_submit_210331155924.csv - РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ credit_default.py  Private / Public : 0.65473 / 0.62702
-cb_submit_210331160809.csv - РїСЂРµРґСЃРєР°Р·Р°РЅРёСЏ credit_default.py  Private / Public : 0.65239 / 0.64625
+    train.csv - the training set
+    test.csv - the test set
+    sampleSubmission.csv - a sample submission file in the correct format
 
-РџСЂРѕС„РёР»СЊ РЅР° РљР°РіРіР»Рµ https://www.kaggle.com/awesomesp68
+Data fields
+
+    Home Ownership - домовладение
+    Annual Income - годовой доход
+    Years in current job - количество лет на текущем месте работы
+    Tax Liens - налоговые обременения
+    Number of Open Accounts - количество открытых счетов
+    Years of Credit History - количество лет кредитной истории
+    Maximum Open Credit - наибольший открытый кредит
+    Number of Credit Problems - количество проблем с кредитом
+    Months since last delinquent - количество месяцев с последней просрочки платежа
+    Bankruptcies - банкротства
+    Purpose - цель кредита
+    Term - срок кредита
+    Current Loan Amount - текущая сумма кредита
+    Current Credit Balance - текущий кредитный баланс
+    Monthly Debt - ежемесячный долг
+    Credit Score - баллы кредитного рейтинга
+    Credit Default - факт невыполнения кредитных обязательств (0 - погашен вовремя, 1 - просрочка)
+
+Current Credit Balance - текущий кредитный баланс - это сумма, которую осталось выплатить по кредиту?
+Monthly Debt - ежемесячный долг - это  ежемесячная сумма, которую необходимо вносить за кредит
