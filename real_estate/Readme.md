@@ -1,3 +1,5 @@
+https://www.kaggle.com/competitions/real-estate-price-prediction-moscow/leaderboard
+
 Корневой каталог для курсового проекта Real Estate Price Prediction
 
 train.csv - the training set
