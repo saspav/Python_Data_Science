@@ -1,3 +1,5 @@
+https://www.kaggle.com/competitions/gb-credit-default/leaderboard
+
 Корневой каталог для курсового проекта Credit Default
 
 train.csv - the training set
